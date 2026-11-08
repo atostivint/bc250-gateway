@@ -1,0 +1,162 @@
+# Starting point for a Kubernetes deployment.
+# One replica on purpose: two gateways would each decide to power the machine
+# down on their own idle clock.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: bc250-gateway-config
+data:
+  config.toml: |
+    [gateway]
+    listen = "0.0.0.0"
+    port = 8100
+
+    [backend]
+    base_url = "http://10.0.0.10:8080"
+    wake_timeout = 180.0
+    poll_interval = 2.0
+    models_cache = "/var/lib/bc250-gateway/models.json"
+
+    [wake]
+    command = ["/usr/local/bin/bc250-plug", "on"]
+    cycle_after_failures = 2
+
+    [shutdown]
+    enabled = true
+    idle_timeout = 1800.0
+    min_uptime = 300.0
+    pre_sleep_command = ["ssh", "-i", "/var/lib/bc250-gateway/keys/id_ed25519",
+                         "-o", "BatchMode=yes", "poweroff@10.0.0.10",
+                         "test ! -e /var/lib/bc250/keep-awake"]
+    poweroff_command = ["ssh", "-i", "/var/lib/bc250-gateway/keys/id_ed25519",
+                        "-o", "BatchMode=yes", "poweroff@10.0.0.10",
+                        "sudo -n systemctl poweroff"]
+    plug_off_command = ["/usr/local/bin/bc250-plug", "off"]
+
+    [keepawake]
+    flag_file = "/var/lib/bc250-gateway/keep-awake"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: bc250-gateway-state
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 64Mi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: bc250-gateway
+  labels:
+    app.kubernetes.io/name: bc250-gateway
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: bc250-gateway
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: bc250-gateway
+    spec:
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      initContainers:
+        # ssh refuses a private key that is group-readable, which is exactly what a
+        # mounted Secret gives you: copy it to a 0600 file owned by the app user.
+        - name: key-perms
+          image: ghcr.io/YOUR_ORG/bc250-gateway:0.1.2
+          command:
+            - python
+            - -c
+            - |
+              import base64, os, shutil
+              base = "/var/lib/bc250-gateway"
+              shutil.rmtree(os.path.join(base, "keys"), ignore_errors=True)
+              os.makedirs(os.path.join(base, "keys"), exist_ok=True)
+              raw = open("/src/id_ed25519").read().strip()
+              try:
+                  key = base64.b64decode(raw, validate=True).decode()
+              except Exception:
+                  key = raw
+              target = os.path.join(base, "keys", "id_ed25519")
+              with open(target, "w") as fh:
+                  fh.write(key if key.endswith("\n") else key + "\n")
+              os.chmod(target, 0o600)
+              ssh_dir = os.path.join(base, ".ssh")
+              os.makedirs(ssh_dir, exist_ok=True)
+              os.chmod(ssh_dir, 0o700)
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - { name: secrets, mountPath: /src, readOnly: true }
+            - { name: state, mountPath: /var/lib/bc250-gateway }
+      containers:
+        - name: bc250-gateway
+          image: ghcr.io/YOUR_ORG/bc250-gateway:0.1.2
+          env:
+            - name: HOME
+              value: /var/lib/bc250-gateway
+            - name: BC250_GATEWAY_CONFIG
+              value: /etc/bc250-gateway/config.toml
+            # whatever bc250-plug needs, from a Secret:
+            - name: HA_WEBHOOK_BASE
+              valueFrom: { secretKeyRef: { name: bc250-gateway, key: ha_webhook_base } }
+          ports:
+            - { name: http, containerPort: 8100 }
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          readinessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet: { path: /health, port: http }
+            initialDelaySeconds: 20
+            periodSeconds: 30
+          resources:
+            requests: { cpu: 50m, memory: 64Mi }
+            limits: { cpu: 500m, memory: 256Mi }
+          volumeMounts:
+            - { name: config, mountPath: /etc/bc250-gateway, readOnly: true }
+            - { name: state, mountPath: /var/lib/bc250-gateway }
+            - { name: tmp, mountPath: /tmp }
+      volumes:
+        - name: config
+          configMap:
+            name: bc250-gateway-config
+        - name: secrets
+          secret:
+            secretName: bc250-gateway
+            defaultMode: 0440
+        - name: state
+          persistentVolumeClaim:
+            claimName: bc250-gateway-state
+        - name: tmp
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: bc250-gateway
+spec:
+  selector:
+    app.kubernetes.io/name: bc250-gateway
+  ports:
+    - { name: http, port: 8100, targetPort: http }

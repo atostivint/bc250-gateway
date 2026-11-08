@@ -1,0 +1,48 @@
+#!/usr/bin/env bash
+# bc250-plug — turn the BC-250's smart plug on or off through Home Assistant.
+#
+# Two modes, first one wins:
+#   1. HA webhook (no secret in the file):
+#        HA_WEBHOOK_BASE=http://100.127.122.74/api/webhook
+#        HA_WEBHOOK_ON=bc250_plug_on
+#        HA_WEBHOOK_OFF=bc250_plug_off
+#   2. Long-lived token (secret comes from the EnvironmentFile, never clickable here):
+#        HA_BASE=http://100.127.122.74
+#        HA_TOKEN=...
+#        HA_ENTITY=switch.votre_prise
+#
+# Exit non-zero on any failure: the gateway treats a failed plug call as a failed
+# wake and will not pretend the node is coming up.
+set -euo pipefail
+
+action="${1:-}"
+case "$action" in
+  on|off) ;;
+  *) echo "usage: $0 on|off" >&2; exit 2 ;;
+esac
+
+retry() { # retry <attempts> <cmd...>
+  local n="$1"; shift
+  local i=1
+  until "$@"; do
+    if [ "$i" -ge "$n" ]; then return 1; fi
+    sleep 2; i=$((i + 1))
+  done
+}
+
+if [ -n "${HA_WEBHOOK_BASE:-}" ]; then
+  var="HA_WEBHOOK_$(printf '%s' "$action" | tr '[:lower:]' '[:upper:]')"
+  url="${HA_WEBHOOK_BASE%/}/${!var:?$var is not set}"
+  retry 3 curl -fsS -m 15 -X POST "$url" -H 'Content-Type: application/json' -d '{}' >/dev/null
+elif [ -n "${HA_BASE:-}" ] && [ -n "${HA_TOKEN:-}" ] && [ -n "${HA_ENTITY:-}" ]; then
+  svc="turn_${action}"
+  retry 3 curl -fsS -m 15 -X POST "${HA_BASE%/}/api/services/switch/${svc}" \
+    -H "Authorization: Bearer ${HA_TOKEN}" \
+    -H 'Content-Type: application/json' \
+    -d "{\"entity_id\": \"${HA_ENTITY}\"}" >/dev/null
+else
+  echo "bc250-plug: no Home Assistant credentials in the environment" >&2
+  exit 1
+fi
+
+echo "plug $action ok"

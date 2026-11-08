@@ -1,0 +1,58 @@
+# Configuration du proxy (ConfigMap). Aucune valeur secrète ici : le jeton
+# Home Assistant et la clé SSH viennent du Secret `bc250-gateway`.
+[gateway]
+# Dans le pod, le proxy écoute sur toutes les interfaces du pod ; seul le
+# Service/Ingress décide qui l'atteint.
+listen = "0.0.0.0"
+port = 8100
+
+[backend]
+# La BC-250, vue depuis le cluster (vérifié : 200 sur /health depuis un pod).
+# ⚠️ Adresse IP : poser une réservation DHCP eero pour la carte, sinon un bail
+# renouvelé casse la passerelle sans rien dire.
+base_url = "http://10.0.0.10:8080"
+health_path = "/health"
+health_timeout = 3.0
+# Démarrage à froid mesuré : 49,3 s (24,7 firmware + userspace) + chargement du
+# modèle. Garder de la marge : le client attend, il ne doit jamais être coupé.
+wake_timeout = 180.0
+poll_interval = 2.0
+models_cache = "/var/lib/bc250-gateway/models.json"
+monitor_interval = 15.0
+
+[wake]
+# argv, sans shell. Sur cette carte la prise EST le bouton power : elle démarre
+# dès que le 12 V arrive, et n'a aucune alimentation de veille pour du WoL.
+command = ["/usr/local/bin/bc250-plug", "on"]
+timeout = 60.0
+# Nombre d'échecs de réveil consécutifs avant de couper/rallumer la prise. À 1,
+# une simple erreur d'adresse power-cycle une machine peut-être saine : c'est ce
+# qui a failli arriver le 07/11 quand la carte est passée de .29 à .240.
+cycle_after_failures = 2
+
+[shutdown]
+enabled = true
+idle_timeout = 1800.0      # 30 min sans requête réelle (les /v1/models ne comptent pas)
+min_uptime = 300.0         # jamais d'extinction dans les 5 premières minutes
+# Garde d'occupation : sortie non nulle = on n'éteint pas, on repart pour une
+# fenêtre complète. Deux conditions : personne sur le bureau graphique (session
+# Class=user Type=x11|wayland — pas le greeter GDM, pas une session SSH, qui
+# resterait ouverte des heures et bloquerait l'extinction pour rien) et pas de
+# drapeau keep-awake.
+pre_sleep_command = ["ssh", "-i", "/var/lib/bc250-gateway/keys/id_ed25519",
+                    "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "ConnectTimeout=10", "poweroff@10.0.0.10",
+                    "busy=0; for s in $(loginctl list-sessions --no-legend | cut -d\" \" -f1); do t=$(loginctl show-session $s -p Type --value 2>/dev/null); c=$(loginctl show-session $s -p Class --value 2>/dev/null); [ \"$c\" = user ] && { [ \"$t\" = x11 ] || [ \"$t\" = wayland ]; } && busy=1; done; [ \"$busy\" = 0 ] && [ ! -e /var/lib/bc250/keep-awake ]"]
+pre_sleep_timeout = 20.0
+# Arrêt propre d'abord, coupure de la prise ensuite : couper le 12 V d'un OS
+# vivant est un arrachement à froid du SSD.
+poweroff_command = ["ssh", "-i", "/var/lib/bc250-gateway/keys/id_ed25519",
+                    "-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new",
+                    "-o", "ConnectTimeout=10", "poweroff@10.0.0.10",
+                    "sudo -n systemctl poweroff"]
+plug_off_command = ["/usr/local/bin/bc250-plug", "off"]
+down_timeout = 120.0
+cycle_delay = 8.0
+
+[keepawake]
+flag_file = "/var/lib/bc250-gateway/keep-awake"
