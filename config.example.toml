@@ -52,6 +52,12 @@ poweroff_command = ["ssh", "-i", "/var/lib/bc250-gateway/keys/id_ed25519",
                     "sudo -n systemctl poweroff"]
 plug_off_command = ["/usr/local/bin/bc250-plug", "off"]
 down_timeout = 120.0
+# Délai entre « le backend ne répond plus » et la coupure de la prise. /health
+# et même le ping disparaissent bien avant la fin de l'arrêt (mesuré : 5 s après
+# l'ordre), alors que le noyau n'a pas encore vidé ni démonté les systèmes de
+# fichiers. 90 s couvrent le délai que systemd s'accorde pour arrêter un montage.
+# Fail-safe : si la carte répond de nouveau pendant l'attente, on ne coupe pas.
+plug_off_grace = 90.0
 cycle_delay = 8.0
 
 [keepawake]

@@ -54,6 +54,10 @@ min_uptime = 1.0
 # exits non-zero vetoes the shutdown (which is what 409 means below).
 poweroff_command = ["$PWD/fake_actions.sh", "poweroff"]
 plug_off_command = ["$PWD/fake_actions.sh", "plug-off"]
+# La prise ne tombe pas à la seconde où le backend se tait : le noyau doit
+# encore vider et démonter les disques. Court ici pour garder le banc rapide,
+# mais non nul : la suite vérifie que l'écart poweroff -> plug_off le respecte.
+plug_off_grace = 4.0
 
 [keepawake]
 flag_file = "$RUN/keep-awake"

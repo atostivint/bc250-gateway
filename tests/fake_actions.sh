@@ -20,7 +20,14 @@ case "$cmd" in
     ;;
   poweroff)
     echo "poweroff $(date +%s)" >> "$BASE/events.log"
-    ( sleep "${FAKE_POWEROFF_DELAY:-1}"; rm -f "$BASE/up" ) &
+    if [ -e "$BASE/reboot" ]; then
+      # La machine s'arrête puis redémarre toute seule, en plein délai de grâce :
+      # le proxy doit abandonner la coupure de prise au lieu d'arracher un OS qui
+      # remonte.
+      ( sleep "${FAKE_POWEROFF_DELAY:-1}"; rm -f "$BASE/up"; sleep 2; touch "$BASE/up" ) &
+    else
+      ( sleep "${FAKE_POWEROFF_DELAY:-1}"; rm -f "$BASE/up" ) &
+    fi
     ;;
   plug-off)
     echo "plug_off $(date +%s)" >> "$BASE/events.log"

@@ -37,9 +37,18 @@ then cut the plug"). Writing it took one file.
   fires; the real stream follows untouched.
 - **`/v1/models` from a disk cache**, so a dashboard polling the model list never
   costs 70 W.
-- **Two-stage sleep**: graceful shutdown command → wait until the host stops
-  answering `/health` → *then* the power-off command. Cutting the 12 V on a live
-  OS is a cold yank on its SSD.
+- **Three-stage sleep**: graceful shutdown command → wait until the host stops
+  answering `/health` → wait `plug_off_grace` seconds (90 by default) → *then*
+  the power-off command. Cutting the 12 V on a live OS is a cold yank on its
+  SSD, and `/health` dies long before the kernel has flushed and unmounted its
+  filesystems. If the node answers again during the grace window (a reboot, a
+  shutdown that failed), the plug is left alone.
+- **A broken transport does not mean a sleeping machine.** A client dropping a
+  long stream and a dead board raise the same `httpx.RequestError`; the state
+  only flips to `asleep` once `/health` actually fails, and a periodic
+  reconciliation moves a wrongly-`asleep` state back to `ready` when the board
+  answers again. Getting this wrong once meant the idle timer never restarted
+  and the board stayed powered all night.
 - **No power cycle on the first failed wake** (`cycle_after_failures`, default 2).
   A dead machine and a machine that moved to another address look identical from
   here; only the second consecutive failure is allowed to cut and restore power.

@@ -4,3 +4,4 @@ tests/run/
 /models.json
 /config.toml
 keys/
+tests/run-drift/

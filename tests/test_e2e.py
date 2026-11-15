@@ -33,6 +33,20 @@ def events():
         return []
 
 
+def events_full():
+    """[(nom, horodatage)] — l'ordre seul ne dit pas si la prise est tombée trop tôt."""
+    try:
+        out = []
+        for line in LOG.read_text().splitlines():
+            if not line.strip():
+                continue
+            name, _, ts = line.partition(" ")
+            out.append((name, float(ts) if ts.strip() else 0.0))
+        return out
+    except FileNotFoundError:
+        return []
+
+
 def status(c):
     return c.get(f"{GW}/admin/status").json()
 
@@ -56,7 +70,30 @@ def main():
     check("poweroff before plug_off",
           "poweroff" in ev and "plug_off" in ev and ev.index("poweroff") < ev.index("plug_off"),
           str(ev))
+    # La prise ne doit PAS tomber à la seconde où le backend se tait : l'OS n'a
+    # pas fini de vider et démonter ses disques. C'est l'arrachement à froid du
+    # 10/11/2026 (5 s d'écart, journal de la carte coupé en plein démontage).
+    ts = events_full()
+    po = [t for n, t in ts if n == "poweroff"]
+    pf = [t for n, t in ts if n == "plug_off"]
+    gap = (pf[-1] - po[-1]) if po and pf else -1
+    check(f"grâce de 4 s respectée avant la coupure (écart {gap:.1f}s)", gap >= 4.0, f"{gap:.1f}s")
     check("state asleep", status(c)["state"] == "asleep", str(status(c)))
+
+    print("2b. une carte qui redémarre pendant la grâce n'est pas débranchée")
+    c.post(f"{GW}/admin/wake", timeout=60)
+    check("réveillée pour le test", status(c)["state"] == "ready", str(status(c)))
+    before = len([e for e in events() if e == "plug_off"])
+    (BASE / "reboot").touch()          # le faux backend revient 2 s après son arrêt
+    r = c.post(f"{GW}/admin/sleep", timeout=60)
+    st = status(c)
+    check("extinction abandonnée", r.status_code == 409, str(r.status_code))
+    check("aucune coupure de prise", len([e for e in events() if e == "plug_off"]) == before,
+          str(events()))
+    check("la carte reste considérée allumée", st["state"] == "ready", str(st))
+    (BASE / "reboot").unlink(missing_ok=True)
+    r = c.post(f"{GW}/admin/sleep", timeout=60)
+    check("retour au repos pour la suite", status(c)["state"] == "asleep", str(status(c)))
 
     print("3. /v1/models while asleep is served from cache and sends no wake")
     before = len([e for e in events() if e == "plug_on"])

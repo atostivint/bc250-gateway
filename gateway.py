@@ -10,7 +10,9 @@ Sits in front of the BC-250's llama-server router on an always-on host:
   * /v1/models is answered from a disk cache while the node sleeps, so polling
     a model list never wakes it;
   * after a configurable idle period with no real traffic, power the machine
-    down gracefully, then cut the plug (order matters: never cut a live OS).
+    down gracefully, then cut the plug (order matters: never cut a live OS —
+    and the plug only goes off once the backend has been unreachable for a
+    grace period, so the kernel can finish flushing and unmounting disks).
 
 The idle detector lives here, not on the node: the gateway sees every real
 request. Fail-safe direction is deliberate -- if this process dies, the node
@@ -86,6 +88,15 @@ class Config:
     pre_sleep_command: list[str] = field(default_factory=list)
     pre_sleep_timeout: float = 20.0
     down_timeout: float = 120.0
+    # Délai entre « le backend ne répond plus » et la coupure de la prise.
+    # /health et même le ping disparaissent bien avant la fin de l'arrêt (mesuré
+    # le 10/11/2026 : 5 s après l'ordre), alors que le noyau n'a pas encore vidé
+    # ni démonté les systèmes de fichiers. 90 s couvrent le délai que systemd
+    # s'accorde lui-même pour arrêter un montage ; une carte déjà arrêtée ne
+    # consomme presque rien pendant cette attente, alors qu'une coupure trop
+    # précoce arrache le SSD. Fail-safe : si la carte répond de nouveau, on ne
+    # coupe pas.
+    plug_off_grace: float = 90.0
     cycle_delay: float = 8.0
 
     keepawake_file: str = "/var/lib/bc250-gateway/keep-awake"
@@ -122,6 +133,7 @@ class Config:
         c.pre_sleep_command = list(s.get("pre_sleep_command", []))
         c.pre_sleep_timeout = float(s.get("pre_sleep_timeout", c.pre_sleep_timeout))
         c.down_timeout = float(s.get("down_timeout", c.down_timeout))
+        c.plug_off_grace = max(0.0, float(s.get("plug_off_grace", c.plug_off_grace)))
         c.cycle_delay = float(s.get("cycle_delay", c.cycle_delay))
 
         k = raw.get("keepawake", {})
@@ -153,6 +165,7 @@ class Gateway:
         self.wakes = 0
         self.sleeps = 0
         self.consecutive_wake_failures = 0
+        self.asleep_ticks = 0          # cadence de la réconciliation en état « asleep »
         self.keep_awake_mem = False
         self._lock = asyncio.Lock()
         self._models_cache: dict[str, Any] | None = None
@@ -194,6 +207,30 @@ class Gateway:
         except Exception:
             return False
 
+    async def note_backend_error(self, exc: Exception, where: str) -> None:
+        """Un transport cassé ne prouve pas que la machine dort.
+
+        Un client qui lâche un long flux, un keep-alive expiré par un NAT ou un
+        lien qui hoquette produisent le même `httpx.RequestError` qu'une carte
+        éteinte. Basculer l'état sur cette seule exception laissait la passerelle
+        aveugle : /admin/status annonçait « asleep », le moniteur ne testait donc
+        plus la santé et ne coupait plus jamais la prise (11/11/2026, 22 h 26 :
+        carte restée allumée toute la nuit, ~2,8 kWh pour rien).
+        """
+        alive = await self.healthy()
+        LOG.warning(
+            "backend error in %s (%s) -> %s",
+            where, exc, "still up, staying ready" if alive else "unreachable, asleep",
+        )
+        if alive:
+            # La machine répond : le lien a hoqueté, pas elle. On garde l'état et
+            # on remet l'horloge d'inactivité à zéro, sinon la coupure tombe au
+            # milieu de la session du client qui vient de perdre son flux.
+            self.state = "ready"
+            self.last_real_request = time.monotonic()
+        else:
+            self.state = "asleep"
+
     def keep_awake(self) -> bool:
         if self.keep_awake_mem:
             return True
@@ -218,9 +255,15 @@ class Gateway:
             proc.kill()
             raise PowerError(f"command timed out after {timeout}s: {argv[0]}")
         if proc.returncode != 0:
+            # stderr d'abord (les raisons d'un refus y sont écrites), stdout
+            # ensuite : un garde qui explique occupe les deux.
+            detail = " ".join(
+                part.decode(errors="replace").strip()
+                for part in (err, out)
+                if part and part.strip()
+            )[:300]
             raise PowerError(
-                f"command failed ({proc.returncode}): {argv[0]}: "
-                f"{err.decode(errors='replace').strip()[:300]}"
+                f"command failed ({proc.returncode}): {argv[0]}: {detail}"
             )
         if out:
             LOG.debug("out: %s", out.decode(errors="replace").strip()[:300])
@@ -345,11 +388,17 @@ class Gateway:
                 self.state = "ready"
                 LOG.info("node is in use, shutdown deferred")
                 return False
-            LOG.info("idle %.0fs -> shutting the node down", time.monotonic() - self.last_real_request)
+            # max() : sur le chemin « backend already up at start », ready_since est
+            # posé sans last_real_request ; sans ça le log annonce l'uptime du pod
+            # (1,7 M de secondes) au lieu du temps d'inactivité réel.
+            LOG.info("idle %.0fs -> shutting the node down",
+                     time.monotonic() - max(self.last_real_request, self.ready_since))
             try:
                 if self.cfg.poweroff_command:
                     await self._run(self.cfg.poweroff_command, 60)
-                # Wait for the OS to actually be down before cutting the 12 V line.
+                # Étape 1 : le backend applicatif meurt AVANT le noyau. /health
+                # qui ne répond plus veut donc dire « l'arrêt a commencé », pas
+                # « la machine est arrêtée ».
                 deadline = time.monotonic() + self.cfg.down_timeout
                 while time.monotonic() < deadline:
                     if not await self.healthy():
@@ -360,9 +409,27 @@ class Gateway:
                               self.cfg.down_timeout)
                     self.state = "ready"
                     return False
+                # Étape 2 : laisser la séquence d'arrêt vider et démonter les
+                # systèmes de fichiers. Couper la prise ici a déjà arraché le
+                # SSD à froid (10/11/2026 : 5 s après le poweroff, journal de la
+                # carte interrompu en plein démontage).
+                down_at = time.monotonic()
+                grace_end = down_at + self.cfg.plug_off_grace
+                while time.monotonic() < grace_end:
+                    await asyncio.sleep(min(2.0, max(0.0, grace_end - time.monotonic())))
+                    if await self.healthy():
+                        LOG.warning(
+                            "node answered again %.0fs into the shutdown grace; NOT cutting "
+                            "the plug (reboot or failed shutdown)",
+                            time.monotonic() - down_at,
+                        )
+                        self.state = "ready"
+                        self.ready_since = time.monotonic()
+                        return False
                 await self._power_off_plug()
                 self.sleeps += 1
-                LOG.info("node down, plug off")
+                LOG.info("node unreachable for %.0fs, plug off",
+                         time.monotonic() - down_at)
                 self.state = "asleep"
                 return True
             except PowerError as exc:
@@ -390,6 +457,17 @@ class Gateway:
                         await self.sleep_backend()
                 elif self.state in {"asleep", "sleeping"}:
                     self.state = "asleep"
+                    # Réconciliation : une machine qui répond n'est pas endormie.
+                    # Sans ce test, un état faussé reste faussé pour toujours — la
+                    # boucle ne sondait la santé que dans l'état « ready », donc le
+                    # timer d'inactivité ne repartait jamais (11/11/2026).
+                    self.asleep_ticks += 1
+                    if self.asleep_ticks % 4 == 0 and await self.healthy():
+                        LOG.warning("state said asleep but the backend answers -> ready")
+                        self.state = "ready"
+                        self.asleep_ticks = 0
+                        self.ready_since = time.monotonic()
+                        self.last_real_request = self.ready_since
             except asyncio.CancelledError:
                 raise
             except Exception:
@@ -571,7 +649,7 @@ def build_app(gw: Gateway) -> FastAPI:
                 r = await gw._client.request(request.method, url, headers=fwd_headers, content=body,
                                              timeout=httpx.Timeout(600.0, connect=10.0))
             except httpx.RequestError as exc:
-                gw.state = "asleep"
+                await gw.note_backend_error(exc, "proxy")
                 return JSONResponse({"error": {"message": f"backend error: {exc}"}}, status_code=502)
             out_headers = {k: v for k, v in r.headers.items() if k.lower() not in HOP_HEADERS}
             return Response(r.content, status_code=r.status_code, headers=out_headers)
@@ -610,7 +688,7 @@ async def _stream_upstream(gw: Gateway, method: str, url: str, headers: dict[str
             async for chunk in r.aiter_raw():
                 yield chunk
     except httpx.RequestError as exc:
-        gw.state = "asleep"
+        await gw.note_backend_error(exc, "stream")
         yield f"event: error\ndata: {json.dumps({'detail': f'backend error: {exc}'})}\n\n".encode()
 
 
@@ -659,6 +737,7 @@ def main() -> int:
         if await gw.healthy():
             gw.state = "ready"
             gw.ready_since = time.monotonic()
+            gw.last_real_request = gw.ready_since
             LOG.info("backend already up at start")
 
     @app.on_event("shutdown")
