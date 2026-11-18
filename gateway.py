@@ -175,6 +175,7 @@ class Gateway:
         # compteur est > 0, node endormi = flux tué.
         self.active_requests = 0
         self.last_wake_at = 0.0
+        self.last_plug_off_at = 0.0
         self.wakes = 0
         self.sleeps = 0
         self.consecutive_wake_failures = 0
@@ -376,6 +377,16 @@ class Gateway:
     async def _power_on(self) -> bool:
         if not self.cfg.wake_command:
             raise PowerError("wake.command is not configured")
+        # Une requête arrive parfois dans la foulée de l'extinction (flux en
+        # attente, sonde, client qui réveille). Rallumer 100 ms après avoir
+        # coupé laisse les condensateurs de l'alimentation chargés : la carte
+        # reste alimentée mais ne boot pas. On impose le même délai que le
+        # cycle de récupération entre off et on, quelle que soit la voie.
+        if self.last_plug_off_at:
+            remaining = self.cfg.cycle_delay - (time.monotonic() - self.last_plug_off_at)
+            if remaining > 0:
+                LOG.info("réveil différé de %.1fs (délai minimal après coupure)", remaining)
+                await asyncio.sleep(remaining)
         await self._run(self.cfg.wake_command, self.cfg.wake_command_timeout)
         return True
 
@@ -386,6 +397,7 @@ class Gateway:
             except PowerError as exc:
                 LOG.error("plug-off failed: %s", exc)
                 raise
+            self.last_plug_off_at = time.monotonic()
 
     # -- sleep -------------------------------------------------------------- #
     async def sleep_backend(self) -> bool:

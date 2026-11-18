@@ -191,6 +191,22 @@ def main():
     check("cycle immediat: off puis on", ev2[:2] == ["plug_off", "plug_on"], str(ev2))
     (BASE / "never_boot").unlink(missing_ok=True)
 
+    print("9. un réveil juste après l'extinction attend le délai minimal hors-tension")
+    # Scénario du 18/11 : poweroff, plug off, puis une requête de réveil arrive
+    # 100 ms plus tard. Sans garde, la carte est realimentée avant d'avoir
+    # vidé son alim et reste "on mais morte" pendant plusieurs minutes.
+    before = events_full()
+    r = c.post(f"{GW}/admin/wake", timeout=90)
+    ev = [e for e in events_full()[len(before):] if e[0] == "plug_on"]
+    check("réveil accepté", r.status_code == 200, str(r.status_code))
+    check("un seul plug_on", len(ev) == 1, str(ev))
+    off_before = [e for e in before if e[0] == "plug_off"]
+    if off_before and ev:
+        gap = ev[-1][1] - off_before[-1][1]
+        check("délai minimum après coupure respecté", gap >= 0.8, f"gap={gap:.3f}s")
+    else:
+        check("coupure et réveil observés", False, str(events_full()[-6:]))
+
     print(f"\n{ok_count} passed, {fail_count} failed")
     return 1 if fail_count else 0
 
