@@ -35,7 +35,10 @@ from typing import Any
 
 import httpx
 import uvicorn
-from fastapi import FastAPI, Request
+import websockets
+from websockets.asyncio.client import connect as ws_connect
+from websockets.exceptions import ConnectionClosed
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 
 LOG = logging.getLogger("bc250-gateway")
@@ -64,6 +67,9 @@ class Config:
     api_key: str = ""
 
     backend_url: str = "http://127.0.0.1:8080"
+    # Realtime (WebSocket) backend: the speech-to-speech server. Empty disables
+    # the /v1/realtime route. http(s) is normalised to ws(s).
+    speech_url: str = ""
     health_path: str = "/health"
     health_timeout: float = 3.0
     wake_timeout: float = 180.0
@@ -118,6 +124,13 @@ class Config:
         c.wake_timeout = float(b.get("wake_timeout", c.wake_timeout))
         c.poll_interval = float(b.get("poll_interval", c.poll_interval))
         c.models_cache = b.get("models_cache", c.models_cache)
+
+        sp = raw.get("speech", {})
+        c.speech_url = str(sp.get("base_url", c.speech_url) or "").rstrip("/")
+        if c.speech_url.startswith("http://"):
+            c.speech_url = "ws://" + c.speech_url[len("http://"):]
+        elif c.speech_url.startswith("https://"):
+            c.speech_url = "wss://" + c.speech_url[len("https://"):]
 
         w = raw.get("wake", {})
         c.wake_command = list(w.get("command", []))
@@ -494,11 +507,13 @@ def build_app(gw: Gateway) -> FastAPI:
     cfg = gw.cfg
     app = FastAPI(title="bc250-gateway", docs_url=None, redoc_url=None, openapi_url=None)
 
-    def authorized(request: Request) -> bool:
+    def authorized_headers(headers: Any) -> bool:
         if not cfg.api_key:
             return True
-        auth = request.headers.get("authorization", "")
-        return auth == f"Bearer {cfg.api_key}"
+        return headers.get("authorization", "") == f"Bearer {cfg.api_key}"
+
+    def authorized(request: Request) -> bool:
+        return authorized_headers(request.headers)
 
     def status_payload() -> dict[str, Any]:
         now = time.monotonic()
@@ -514,6 +529,7 @@ def build_app(gw: Gateway) -> FastAPI:
             else None,
             "idle_timeout_s": cfg.idle_timeout,
             "backend": cfg.backend_url,
+            "speech_backend": cfg.speech_url or None,
         }
 
     @app.get("/health")
@@ -585,6 +601,52 @@ def build_app(gw: Gateway) -> FastAPI:
             except Exception as exc:
                 return JSONResponse({"error": f"backend error: {exc}"}, status_code=502)
         return JSONResponse({"error": "backend unavailable"}, status_code=503)
+
+    # -- Realtime (WebSocket) surface --------------------------------------- #
+    @app.websocket("/v1/realtime")
+    async def realtime(websocket: WebSocket) -> None:
+        """Bridge Conduit's OpenAI Realtime socket to the speech-to-speech server.
+
+        Plain HTTP proxying cannot carry an Upgrade: HOP_HEADERS strips it, and
+        the catch-all route forwards to the LLM router (8080), not to the voice
+        server (8765). This route speaks WebSocket on both sides, keeps the
+        wake/sleep state machine in charge, and refuses cleanly when the voice
+        server was not configured or cannot be reached.
+        """
+        if not authorized_headers(websocket.headers):
+            await websocket.close(code=1008, reason="unauthorized")
+            return
+        if not cfg.speech_url:
+            await websocket.close(code=1012, reason="speech backend not configured")
+            return
+
+        gw.last_real_request = time.monotonic()
+        if gw.state != "ready" and not await gw.ensure_ready():
+            await websocket.close(code=1013, reason="backend unavailable")
+            return
+
+        gw.last_real_request = time.monotonic()
+        gw.active_requests += 1
+        try:
+            await websocket.accept()
+            url = f"{cfg.speech_url}/v1/realtime"
+            if websocket.url.query:
+                url += "?" + websocket.url.query
+            LOG.info("speech bridge: %s <- %s", url, websocket.client)
+            try:
+                async with ws_connect(url, open_timeout=10.0, max_size=8 * 1024 * 1024) as upstream:
+                    await _bridge_realtime(gw, websocket, upstream)
+            except (ConnectionClosed, WebSocketDisconnect):
+                pass
+            except Exception as exc:
+                LOG.warning("speech bridge error: %s", exc)
+                try:
+                    await websocket.close(code=1011, reason="speech backend error")
+                except Exception:
+                    pass
+        finally:
+            gw.last_real_request = time.monotonic()
+            gw.active_requests = max(0, gw.active_requests - 1)
 
     @app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
     async def proxy(path: str, request: Request) -> Response:
@@ -659,6 +721,49 @@ def build_app(gw: Gateway) -> FastAPI:
                 gw.active_requests = max(0, gw.active_requests - 1)
 
     return app
+
+
+async def _bridge_realtime(gw: Gateway, client: WebSocket, upstream: Any) -> None:
+    """Pump frames both ways. Either side ending closes the whole call."""
+    async def client_to_upstream() -> None:
+        while True:
+            message = await client.receive()
+            if message.get("type") == "websocket.disconnect":
+                break
+            gw.last_real_request = time.monotonic()
+            text = message.get("text")
+            data = message.get("bytes")
+            if text is not None:
+                await upstream.send(text)
+            elif data is not None:
+                await upstream.send(data)
+
+    async def upstream_to_client() -> None:
+        async for message in upstream:
+            gw.last_real_request = time.monotonic()
+            if isinstance(message, str):
+                await client.send_text(message)
+            else:
+                await client.send_bytes(message)
+
+    tasks = [asyncio.create_task(client_to_upstream()),
+             asyncio.create_task(upstream_to_client())]
+    try:
+        done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
+        for task in done:
+            if task.cancelled():
+                continue
+            exc = task.exception()
+            if exc and not isinstance(exc, (WebSocketDisconnect, ConnectionClosed)):
+                LOG.warning("speech bridge leg failed: %s", exc)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
 
 
 def _tracked(gw: Gateway, agen):

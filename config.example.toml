@@ -20,6 +20,11 @@ poll_interval = 2.0
 models_cache = "/var/lib/bc250-gateway/models.json"
 monitor_interval = 15.0
 
+# Serveur speech-to-speech (WebSocket Realtime), sur la même carte mais un
+# autre port. Sans cette section, /v1/realtime refuse les connexions.
+[speech]
+base_url = "ws://10.0.0.10:8765"
+
 [wake]
 # argv, sans shell. Sur cette carte la prise EST le bouton power : elle démarre
 # dès que le 12 V arrive, et n'a aucune alimentation de veille pour du WoL.
