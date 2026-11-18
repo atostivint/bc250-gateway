@@ -626,6 +626,11 @@ def build_app(gw: Gateway) -> FastAPI:
             return
 
         gw.last_real_request = time.monotonic()
+        if not await _wait_for_speech(gw, cfg.speech_url, 180.0):
+            await websocket.close(code=1013, reason="speech backend not ready")
+            return
+
+        gw.last_real_request = time.monotonic()
         gw.active_requests += 1
         try:
             await websocket.accept()
@@ -634,7 +639,7 @@ def build_app(gw: Gateway) -> FastAPI:
                 url += "?" + websocket.url.query
             LOG.info("speech bridge: %s <- %s", url, websocket.client)
             try:
-                async with ws_connect(url, open_timeout=10.0, max_size=8 * 1024 * 1024) as upstream:
+                async with ws_connect(url, open_timeout=30.0, max_size=8 * 1024 * 1024) as upstream:
                     await _bridge_realtime(gw, websocket, upstream)
             except (ConnectionClosed, WebSocketDisconnect):
                 pass
@@ -721,6 +726,29 @@ def build_app(gw: Gateway) -> FastAPI:
                 gw.active_requests = max(0, gw.active_requests - 1)
 
     return app
+
+
+async def _wait_for_speech(gw: Gateway, url: str, timeout: float) -> bool:
+    """A cold boot wakes llama first; the voice server needs ~2 min more.
+
+    Poll the TCP port so a call arriving right after a wake waits for the
+    models instead of getting an instant 502.
+    """
+    from urllib.parse import urlsplit
+    parts = urlsplit(url)
+    host = parts.hostname or ""
+    port = parts.port or (443 if parts.scheme == "wss" else 80)
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        try:
+            _, writer = await asyncio.wait_for(
+                asyncio.open_connection(host, port), timeout=2.0)
+            writer.close()
+            return True
+        except Exception:
+            pass
+        await asyncio.sleep(2.0)
+    return False
 
 
 async def _bridge_realtime(gw: Gateway, client: WebSocket, upstream: Any) -> None:
