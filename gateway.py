@@ -710,8 +710,12 @@ def build_app(gw: Gateway) -> FastAPI:
             and not gw.model_known(payload["model"])
         ):
             LOG.warning(
-                "unknown model %r -> 404 without wake (idle clock untouched)",
+                "unknown model %r from %s ua=%r xff=%r -> 404 without wake "
+                "(idle clock untouched)",
                 payload["model"],
+                request.client.host if request.client else "?",
+                request.headers.get("user-agent"),
+                request.headers.get("x-forwarded-for"),
             )
             return JSONResponse(
                 {"error": {"message": f"no router for requested model: {payload['model']}",
