@@ -102,6 +102,15 @@ def main():
     time.sleep(1.0)
     check("no wake sent", len([e for e in events() if e == "plug_on"]) == before, str(events()))
 
+    print("3b. un ID de modèle périmé ne réveille pas une carte éteinte")
+    before = len([e for e in events() if e == "plug_on"])
+    r = c.post(f"{GW}/v1/chat/completions",
+               json={"model": "ancien-modele-supprime",
+                     "messages": [{"role": "user", "content": "x"}]})
+    check("404 sur ID périmé", r.status_code == 404, str(r.status_code))
+    check("aucun réveil", len([e for e in events() if e == "plug_on"]) == before, str(events()))
+    check("state toujours asleep", status(c)["state"] == "asleep", str(status(c)))
+
     print("4. streaming request on a sleeping node: SSE keep-alives, then real tokens")
     t0 = time.time()
     lines = []
@@ -129,6 +138,23 @@ def main():
     # Avant correctif : idle_for_s valait la durée de la requête. Après : ~0.
     check("idle_for_s retombe sous 3 s", (st.get("idle_for_s") or 99) < 3.0, str(st.get("idle_for_s")))
     check("aucune requête en vol", st.get("active_requests") == 0, str(st.get("active_requests")))
+
+    print("4bis. une salve d'IDs périmés ne remet pas l'horloge d'inactivité à zéro")
+    for _ in range(25):
+        r = c.post(f"{GW}/v1/chat/completions",
+                   json={"model": "ancien-modele-supprime",
+                         "messages": [{"role": "user", "content": "x"}]})
+    check("404 sur les 25 requêtes", r.status_code == 404, str(r.status_code))
+    time.sleep(1.2)
+    st = c.get(f"{GW}/admin/status").json()
+    check("idle_for_s continue de monter", (st.get("idle_for_s") or 0) > 1.0,
+          str(st.get("idle_for_s")))
+    check("aucune requête en vol après la salve", st.get("active_requests") == 0,
+          str(st.get("active_requests")))
+    check("un ID connu passe toujours",
+          c.post(f"{GW}/v1/chat/completions",
+                 json={"model": "gpt-oss-20b-MXFP4",
+                       "messages": [{"role": "user", "content": "ok"}]}).status_code == 200)
 
     print("4c. une génération plus longue que idle_timeout n'est pas coupée")
     # idle_timeout vaut 6 s dans ce banc ; on streame 9 tokens à 1 s d'intervalle.

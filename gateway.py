@@ -211,6 +211,24 @@ class Gateway:
         except Exception as exc:  # cache is best-effort, never fatal
             LOG.warning("models cache write failed: %s", exc)
 
+    def model_known(self, model: str) -> bool:
+        """Un ID absent du cache ne peut jamais produire de génération.
+
+        Un client resté sur un ancien nom de modèle envoie des salves de 25
+        requêtes en 4 s. Les compter comme du trafic réel remet l'horloge
+        d'inactivité à zéro et réveille une carte éteinte pour rien : boucle
+        extinction (900 s) -> réveil (8 s) -> boot à froid (54 s). Cache vide =
+        on ne filtre rien, pour ne pas bloquer un client légitime au premier
+        démarrage, avant le premier /v1/models.
+        """
+        cache = self._models_cache
+        if not cache:
+            return True
+        return any(
+            isinstance(m, dict) and m.get("id") == model
+            for m in cache.get("data", [])
+        )
+
     async def healthy(self) -> bool:
         try:
             r = await self._client.get(
@@ -671,6 +689,7 @@ def build_app(gw: Gateway) -> FastAPI:
             return JSONResponse({"error": "unauthorized"}, status_code=401)
 
         body = await request.body()
+        payload: Any = None
         want_stream = False
         if body:
             try:
@@ -678,6 +697,29 @@ def build_app(gw: Gateway) -> FastAPI:
                 want_stream = bool(payload.get("stream"))
             except Exception:
                 want_stream = False
+
+        # Un ID de modèle périmé ne peut jamais générer. Le rejeter ici, avant
+        # tout changement d'état, évite qu'une salve de 404 réveille la carte
+        # et repousse l'extinction. Un échec sur un ID *connu* reste du trafic
+        # réel : on ne touche pas à ce comportement.
+        if (
+            path.startswith("v1/")
+            and isinstance(payload, dict)
+            and isinstance(payload.get("model"), str)
+            and payload["model"]
+            and not gw.model_known(payload["model"])
+        ):
+            LOG.warning(
+                "unknown model %r -> 404 without wake (idle clock untouched)",
+                payload["model"],
+            )
+            return JSONResponse(
+                {"error": {"message": f"no router for requested model: {payload['model']}",
+                           "type": "invalid_request_error", "param": "model",
+                           "code": "model_not_found"}},
+                status_code=404,
+                headers={"x-bc250-state": gw.state},
+            )
 
         # Real traffic resets the idle clock. /v1/models deliberately does not.
         # It is refreshed again when the response ends, and on every streamed
